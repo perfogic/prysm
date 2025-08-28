@@ -436,16 +436,29 @@ func (s *Service) fetchOriginColumns(roBlock blocks.ROBlock, delay time.Duration
 		DownscorePeerOnRPCFault: true,
 	}
 
-	var verifiedRoDataColumnsByRoot map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn
+	var (
+		verifiedRoDataColumnsByRoot map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn
+		missingIndicesByRoot        map[[fieldparams.RootLength]byte]map[uint64]bool
+	)
 	for attempt := uint64(0); ; attempt++ {
-		verifiedRoDataColumnsByRoot, err = sync.FetchDataColumnSidecars(params, []blocks.ROBlock{roBlock}, info.CustodyColumns)
-		if err == nil {
+		verifiedRoDataColumnsByRoot, missingIndicesByRoot, err = sync.FetchDataColumnSidecars(params, []blocks.ROBlock{roBlock}, info.CustodyColumns)
+		if err == nil && len(missingIndicesByRoot) == 0 {
 			break
 		}
 
-		log := log.WithError(err).WithFields(logrus.Fields{
-			"attempt": attempt,
-			"delay":   delay,
+		log := log
+		if err != nil {
+			log = log.WithError(err)
+		}
+
+		missingSidecarsCount := 0
+		for _, missing := range missingIndicesByRoot {
+			missingSidecarsCount += len(missing)
+		}
+		log = log.WithFields(logrus.Fields{
+			"attempt":              attempt,
+			"missingSidecarsCount": missingSidecarsCount,
+			"delay":                delay,
 		})
 
 		if attempt%warningIteration == 0 && attempt > 0 {

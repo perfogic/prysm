@@ -115,9 +115,18 @@ func (s *Service) requestAndSaveMissingDataColumnSidecars(blks []blocks.ROBlock)
 		NewVerifier: s.newColumnsVerifier,
 	}
 
-	sidecarsByRoot, err := FetchDataColumnSidecars(params, blks, info.CustodyColumns)
+	sidecarsByRoot, missingIndicesByRoot, err := FetchDataColumnSidecars(params, blks, info.CustodyColumns)
 	if err != nil {
 		return errors.Wrap(err, "fetch data column sidecars")
+	}
+
+	if len(missingIndicesByRoot) > 0 {
+		missingSidecarsCount := 0
+		for _, missing := range missingIndicesByRoot {
+			missingSidecarsCount += len(missing)
+		}
+
+		return errors.Errorf("missing %d data column sidecars", missingSidecarsCount)
 	}
 
 	// Save the sidecars to the storage.

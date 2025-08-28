@@ -42,24 +42,27 @@ type DataColumnSidecarsParams struct {
 // FetchDataColumnSidecars retrieves data column sidecars from storage and peers for the given
 // blocks and requested data column indices. It employs a multi-step strategy:
 //
-//  1. Direct retrieval: If all requested columns are available in storage, they are
-//     retrieved directly without reconstruction.
-//  2. Reconstruction-based retrieval: If some requested columns are missing but sufficient
+//  1. Storage retrieval: If all requested columns are available in storage, they are
+//     retrieved directly.
+//  2. Reconstruction from storage: If some requested columns are missing in storage but sufficient
 //     stored columns exist (at least the minimum required for reconstruction), the function
 //     reconstructs all columns and extracts the requested indices.
-//  3. Peer retrieval: If storage and reconstruction fail, missing columns are requested
+//  3. Peer retrieval: If storage and reconstruction from storage fail, missing columns are requested
 //     from connected peers that are expected to custody the required data.
+//  4. Reconstruction from storage and peers: If peer retrieval fails, the function attempts to
+//     reconstruct the missing columns using the available data from both storage and the fetched
+//     data from peers.
 //
-// The function returns a map of block roots to their corresponding verified read-only data
-// columns. It returns an error if data column storage is unavailable, if storage/reconstruction
-// operations fail unexpectedly, or if not all requested columns could be retrieved from peers.
+// The function returns:
+// - a map of block roots to their corresponding verified read-only data columns.
+// - a map of block roots to their still missing data column indices after running the function.
 func FetchDataColumnSidecars(
 	params DataColumnSidecarsParams,
 	roBlocks []blocks.ROBlock,
 	indicesMap map[uint64]bool,
-) (map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn, error) {
+) (map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn, map[[fieldparams.RootLength]byte]map[uint64]bool, error) {
 	if len(roBlocks) == 0 || len(indicesMap) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	indices := sortedSliceFromMap(indicesMap)
@@ -73,7 +76,7 @@ func FetchDataColumnSidecars(
 		block := roBlock.Block()
 		commitments, err := block.Body().BlobKzgCommitments()
 		if err != nil {
-			return nil, errors.Wrapf(err, "get blob kzg commitments for block root %#x", roBlock.Root())
+			return nil, nil, errors.Wrapf(err, "get blob kzg commitments for block root %#x", roBlock.Root())
 		}
 		if len(commitments) == 0 {
 			continue
@@ -82,23 +85,25 @@ func FetchDataColumnSidecars(
 		slotsWithCommitments[block.Slot()] = true
 		root := roBlock.Root()
 
-		// Step 1: Get the requested sidecars for this root if available in storage
-		requestedColumns, err := tryGetStoredColumns(params.Storage, root, indices)
+		// Step 1: Get the requested sidecars for this root if available in storage.
+		storedColumns, err := params.Storage.Get(root, indices)
 		if err != nil {
-			return nil, errors.Wrapf(err, "try get direct columns for root %#x", root)
+			return nil, nil, errors.Wrapf(err, "failed to get data columns for block root %#x", root)
 		}
-		if requestedColumns != nil {
-			result[root] = requestedColumns
+
+		result[root] = storedColumns
+		if len(storedColumns) == len(indices) {
+			// We have all requested columns in the storage.
 			continue
 		}
 
 		// Step 2: If step 1 failed, reconstruct the requested sidecars from what is available in storage
-		requestedColumns, err = tryGetReconstructedColumns(params.Storage, root, indices)
+		reconstructedColumns, err := tryGetReconstructedColumns(params.Storage, root, indices)
 		if err != nil {
-			return nil, errors.Wrapf(err, "try get reconstructed columns for root %#x", root)
+			return nil, nil, errors.Wrapf(err, "try get reconstructed columns for root %#x", root)
 		}
-		if requestedColumns != nil {
-			result[root] = requestedColumns
+		if reconstructedColumns != nil {
+			result[root] = reconstructedColumns
 			continue
 		}
 
@@ -116,22 +121,22 @@ func FetchDataColumnSidecars(
 
 	// Early return if no sidecars need to be queried from peers.
 	if len(missingIndicesByRoot) == 0 {
-		return result, nil
+		return result, nil, nil
 	}
 
 	// Step 3b: Request missing sidecars from peers.
 	start, count := time.Now(), computeTotalCount(missingIndicesByRoot)
 	fromPeersResult, err := tryRequestingColumnsFromPeers(params, roBlocks, slotsWithCommitments, missingIndicesByRoot)
 	if err != nil {
-		return nil, errors.Wrap(err, "request from peers")
+		return nil, nil, errors.Wrap(err, "request from peers")
 	}
 
 	log.WithFields(logrus.Fields{"duration": time.Since(start), "count": count}).Debug("Requested data column sidecars from peers")
 
-	// Step 3c: If needed, try to reconstruct missing sidecars from storage and fetched data.
+	// Step 4: If needed, try to reconstruct missing sidecars from storage and fetched data.
 	fromReconstructionResult, err := tryReconstructFromStorageAndPeers(params.Storage, fromPeersResult, indicesMap, missingIndicesByRoot)
 	if err != nil {
-		return nil, errors.Wrap(err, "reconstruct from storage and peers")
+		return nil, nil, errors.Wrap(err, "reconstruct from storage and peers")
 	}
 
 	for root, verifiedSidecars := range fromReconstructionResult {
@@ -145,48 +150,9 @@ func FetchDataColumnSidecars(
 		}
 
 		result[root] = append(result[root], fromPeersResult[root]...)
-
-		storedIndices := indicesByRootStored[root]
-		if len(storedIndices) == 0 {
-			continue
-		}
-
-		storedColumns, err := tryGetStoredColumns(params.Storage, root, sortedSliceFromMap(storedIndices))
-		if err != nil {
-			return nil, errors.Wrapf(err, "try get direct columns for root %#x", root)
-		}
-
-		result[root] = append(result[root], storedColumns...)
 	}
 
-	return result, nil
-}
-
-// tryGetStoredColumns attempts to retrieve all requested data column sidecars directly from storage
-// if they are all available. Returns the sidecars if successful, and nil if at least one
-// requested sidecar is not available in the storage.
-func tryGetStoredColumns(storage filesystem.DataColumnStorageReader, blockRoot [fieldparams.RootLength]byte, indices []uint64) ([]blocks.VerifiedRODataColumn, error) {
-	// Check if all requested indices are present in cache
-	storedIndices := storage.Summary(blockRoot).Stored()
-	allRequestedPresent := true
-	for _, requestedIndex := range indices {
-		if !storedIndices[requestedIndex] {
-			allRequestedPresent = false
-			break
-		}
-	}
-
-	if !allRequestedPresent {
-		return nil, nil
-	}
-
-	// All requested data is present, retrieve directly from DB
-	requestedColumns, err := storage.Get(blockRoot, indices)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get data columns for block root %#x", blockRoot)
-	}
-
-	return requestedColumns, nil
+	return result, missingIndicesByRoot, nil
 }
 
 // tryGetReconstructedColumns attempts to retrieve columns using reconstruction
@@ -318,14 +284,19 @@ func tryRequestingColumnsFromPeers(
 
 // tryReconstructFromStorageAndPeers attempts to reconstruct missing data column sidecars
 // using the data available in the storage and the data fetched from peers.
-// If, for at least one root, the reconstruction is not possible, an error is returned.
+// This function works in "best effort" mode: If there is not enough sidecars to reconstruct
+// what is needed, it will return whatever it could reconstruct.
+// WARNING: This function alters `missingIndicesByRoot` by removing successfully retrieved columns.
+// After running this function, the user can check the content of the (modified) `missingIndicesByRoot` map
+// to check if some sidecars are still missing.
 func tryReconstructFromStorageAndPeers(
 	storage filesystem.DataColumnStorageReader,
 	fromPeersByRoot map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn,
 	indices map[uint64]bool,
 	missingIndicesByRoot map[[fieldparams.RootLength]byte]map[uint64]bool,
 ) (map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn, error) {
-	if len(missingIndicesByRoot) == 0 {
+	initialMissingRootCount := len(missingIndicesByRoot)
+	if initialMissingRootCount == 0 {
 		// Nothing to do, return early.
 		return nil, nil
 	}
@@ -341,13 +312,14 @@ func tryReconstructFromStorageAndPeers(
 		fetchedCount := uint64(len(fromPeersByRoot[root]))
 
 		if storedCount+fetchedCount < minimumColumnsCountToReconstruct {
-			return nil, errors.Errorf("cannot reconstruct all needed columns for root %#x. stored: %d, fetched: %d, minimum: %d", root, storedCount, fetchedCount, minimumColumnsCountToReconstruct)
+			// Skip this root, not enough columns to reconstruct.
+			continue
 		}
 
 		// Load all we have in the store.
 		storedSidecars, err := storage.Get(root, nil)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to get stored sidecars for root %#x", root)
+			return nil, errors.Wrapf(err, "storage get for root %#x", root)
 		}
 
 		sidecars := make([]blocks.VerifiedRODataColumn, 0, storedCount+fetchedCount)
@@ -357,7 +329,7 @@ func tryReconstructFromStorageAndPeers(
 		// Attempt reconstruction.
 		reconstructedSidecars, err := peerdas.ReconstructDataColumnSidecars(sidecars)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to reconstruct data columns for root %#x", root)
+			return nil, errors.Wrapf(err, "reconstruct data column sidecars for root %#x", root)
 		}
 
 		// Select only sidecars we need.
@@ -366,11 +338,20 @@ func tryReconstructFromStorageAndPeers(
 				result[root] = append(result[root], sidecar)
 			}
 		}
+
+		// Remove the root from the missing indices.
+		delete(missingIndicesByRoot, root)
+	}
+
+	reconstructedRootCount := len(result)
+	if reconstructedRootCount == 0 {
+		return nil, nil
 	}
 
 	log.WithFields(logrus.Fields{
-		"rootCount": len(missingIndicesByRoot),
-		"elapsed":   time.Since(start),
+		"elapsed":                 time.Since(start),
+		"initialMissingRootCount": initialMissingRootCount,
+		"reconstructedRootCount":  reconstructedRootCount,
 	}).Debug("Reconstructed from storage and peers")
 
 	return result, nil

@@ -410,9 +410,18 @@ func (f *blocksFetcher) fetchSidecars(ctx context.Context, pid peer.ID, peers []
 		roBlocks = append(roBlocks, block.Block)
 	}
 
-	verifiedRoDataColumnsByRoot, err := prysmsync.FetchDataColumnSidecars(params, roBlocks, info.CustodyColumns)
+	verifiedRoDataColumnsByRoot, missingIndicesByRoot, err := prysmsync.FetchDataColumnSidecars(params, roBlocks, info.CustodyColumns)
 	if err != nil {
 		return "", errors.Wrap(err, "fetch data column sidecars")
+	}
+
+	if len(missingIndicesByRoot) > 0 {
+		missingSidecarsCount := 0
+		for _, missing := range missingIndicesByRoot {
+			missingSidecarsCount += len(missing)
+		}
+
+		return "", errors.Errorf("missing %d data column sidecars", missingSidecarsCount)
 	}
 
 	// Populate the response.

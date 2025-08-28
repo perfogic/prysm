@@ -33,11 +33,12 @@ import (
 
 func TestFetchDataColumnSidecars(t *testing.T) {
 	numberOfColumns := params.BeaconConfig().NumberOfColumns
-	// Slot 1: All needed sidecars are available in storage
-	// Slot 2: No commitment
-	// Slot 3: All sidecars are saved excepted the needed ones
-	// Slot 4: Some sidecars are in the storage, other have to be retrieved from peers.
-	// Slot 5: Some sidecars are in the storage, other have to be retrieved from peers but peers do not deliver all requested sidecars.
+	// Slot 1: All needed sidecars are available in storage ==> Retrieval from storage only.
+	// Slot 2: No commitment ==> Nothing to do.
+	// Slot 3: All sidecars are saved excepted the needed ones ==> Reconstruction from storage.
+	// Slot 4: Some sidecars are in the storage, other have to be retrieved from peers ==> Retrieval from storage and peers.
+	// Slot 5: Some sidecars are in the storage, other have to be retrieved from peers but peers do not deliver all requested sidecars ==> Retrieval from storage and peers then reconstruction.
+	// Slot 6: Some sidecars are in the storage, other have to be retrieved from peers ==> Retrieval from storage and peers but peers do not respond.
 
 	params.SetupTestConfigCleanup(t)
 	cfg := params.BeaconConfig().Copy()
@@ -115,6 +116,14 @@ func TestFetchDataColumnSidecars(t *testing.T) {
 	err = storage.Save(toStore5)
 	require.NoError(t, err)
 
+	// Block 6
+	block6, _, verifiedSidecars6 := util.GenerateTestFuluBlockWithSidecars(t, blobCount, util.WithSlot(6))
+	root6 := block6.Root()
+	toStore6 := []blocks.VerifiedRODataColumn{verifiedSidecars6[106]}
+
+	err = storage.Save(toStore6)
+	require.NoError(t, err)
+
 	// Custody columns with this private key and 4-cgc: 31, 81, 97, 105
 	privateKeyBytes := [32]byte{1}
 	privateKey, err := crypto.UnmarshalSecp256k1PrivateKey(privateKeyBytes[:])
@@ -128,12 +137,12 @@ func TestFetchDataColumnSidecars(t *testing.T) {
 	p2p.Connect(other)
 
 	p2p.Peers().SetChainState(other.PeerID(), &ethpb.StatusV2{
-		HeadSlot: 5,
+		HeadSlot: 6,
 	})
 
 	expectedRequest := &ethpb.DataColumnSidecarsByRangeRequest{
 		StartSlot: 4,
-		Count:     2,
+		Count:     3,
 		Columns:   []uint64{31, 81},
 	}
 
@@ -178,23 +187,36 @@ func TestFetchDataColumnSidecars(t *testing.T) {
 		NewVerifier: newDataColumnsVerifier,
 	}
 
-	expected := map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn{
+	expectedResult := map[[fieldparams.RootLength]byte][]blocks.VerifiedRODataColumn{
 		root1: {verifiedSidecars1[31], verifiedSidecars1[81], verifiedSidecars1[106]},
 		// no root2 (no commitments in this block)
 		root3: {verifiedSidecars3[31], verifiedSidecars3[81], verifiedSidecars3[106]},
-		root4: {verifiedSidecars4[31], verifiedSidecars4[81], verifiedSidecars4[106]},
+		root4: {verifiedSidecars4[106], verifiedSidecars4[31], verifiedSidecars4[81]},
 		root5: {verifiedSidecars5[31], verifiedSidecars5[81], verifiedSidecars5[106]},
+		root6: {verifiedSidecars6[106]},
 	}
 
-	blocks := []blocks.ROBlock{block1, block2, block3, block4, block5}
-	actual, err := FetchDataColumnSidecars(params, blocks, indices)
+	expectedMissingIndicesByRoot := map[[fieldparams.RootLength]byte]map[uint64]bool{
+		root6: {31: true, 81: true},
+	}
+
+	blocks := []blocks.ROBlock{block1, block2, block3, block4, block5, block6}
+	actualResult, actualMissingIndicesByRoot, err := FetchDataColumnSidecars(params, blocks, indices)
 	require.NoError(t, err)
 
-	require.Equal(t, len(expected), len(actual))
-	for root := range expected {
-		require.Equal(t, len(expected[root]), len(actual[root]))
-		for i := range expected[root] {
-			require.DeepSSZEqual(t, expected[root][i], actual[root][i])
+	require.Equal(t, len(expectedResult), len(actualResult))
+	for root := range expectedResult {
+		require.Equal(t, len(expectedResult[root]), len(actualResult[root]))
+		for i := range expectedResult[root] {
+			require.DeepSSZEqual(t, expectedResult[root][i], actualResult[root][i])
+		}
+	}
+
+	require.Equal(t, len(expectedMissingIndicesByRoot), len(actualMissingIndicesByRoot))
+	for root := range expectedMissingIndicesByRoot {
+		require.Equal(t, len(expectedMissingIndicesByRoot[root]), len(actualMissingIndicesByRoot[root]))
+		for i := range expectedMissingIndicesByRoot[root] {
+			require.Equal(t, expectedMissingIndicesByRoot[root][i], actualMissingIndicesByRoot[root][i])
 		}
 	}
 }
