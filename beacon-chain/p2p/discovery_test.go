@@ -25,6 +25,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers/scorers"
 	testp2p "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/wrapper"
 	leakybucket "github.com/OffchainLabs/prysm/v7/container/leaky-bucket"
@@ -34,6 +35,7 @@ import (
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/testing/assert"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
+	gethCrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -1314,9 +1316,110 @@ func TestGetPort_ZeroPortTreatedAsAbsent(t *testing.T) {
 	localNode := createTestNodeRandom(t)
 	localNode.Set(enr.TCP(0))
 
-	port, ok, err := getPort(localNode.Node(), tcp)
+	port, ok, err := getPort(localNode.Node(), tcp, localNode.Node().IP())
 
 	require.NoError(t, err)
 	require.Equal(t, false, ok)
 	require.Equal(t, uint(0), port)
+}
+
+// createTestNodeWithEntries creates a signed node record holding only the given entries.
+func createTestNodeWithEntries(t *testing.T, entries ...enr.Entry) (*enode.Node, peer.ID) {
+	key, err := gethCrypto.GenerateKey()
+	require.NoError(t, err)
+
+	var record enr.Record
+	for _, entry := range entries {
+		record.Set(entry)
+	}
+	require.NoError(t, enode.SignV4(&record, key))
+
+	node, err := enode.New(enode.ValidSchemes, &record)
+	require.NoError(t, err)
+
+	pubkey, err := ecdsaprysm.ConvertToInterfacePubkey(&key.PublicKey)
+	require.NoError(t, err)
+	id, err := peer.IDFromPublicKey(pubkey)
+	require.NoError(t, err)
+
+	return node, id
+}
+
+func TestRetrieveMultiAddrsFromNode_IPv6Ports(t *testing.T) {
+	resetCfg := features.InitWithReset(&features.Flags{EnableQUIC: true})
+	defer resetCfg()
+
+	ip4 := net.ParseIP("192.168.77.2")
+	ip6 := net.ParseIP("2001:db8::2")
+
+	testCases := []struct {
+		name     string
+		entries  []enr.Entry
+		expected []string
+	}{
+		{
+			name:     "IPv4 only",
+			entries:  []enr.Entry{enr.IP(ip4), enr.TCP(30304), quicProtocol(30305)},
+			expected: []string{"/ip4/192.168.77.2/udp/30305/quic-v1", "/ip4/192.168.77.2/tcp/30304"},
+		},
+		{
+			name:     "IPv6 only with tcp6 and quic6",
+			entries:  []enr.Entry{enr.IP(ip6), enr.TCP6(30324), enr.QUIC6(30325)},
+			expected: []string{"/ip6/2001:db8::2/udp/30325/quic-v1", "/ip6/2001:db8::2/tcp/30324"},
+		},
+		{
+			name:     "IPv6 only with tcp and quic",
+			entries:  []enr.Entry{enr.IP(ip6), enr.TCP(30304), quicProtocol(30305)},
+			expected: []string{"/ip6/2001:db8::2/udp/30305/quic-v1", "/ip6/2001:db8::2/tcp/30304"},
+		},
+		{
+			name: "dual stack with IPv6 selected",
+			entries: []enr.Entry{
+				enr.IP(ip4), enr.TCP(30304), quicProtocol(30305),
+				enr.IP(ip6), enr.TCP6(30324), enr.QUIC6(30325),
+			},
+			expected: []string{"/ip6/2001:db8::2/udp/30325/quic-v1", "/ip6/2001:db8::2/tcp/30324"},
+		},
+		{
+			name: "dual stack with IPv4 selected",
+			entries: []enr.Entry{
+				enr.IP(net.ParseIP("1.2.3.4")), enr.TCP(30304), quicProtocol(30305),
+				enr.IP(net.ParseIP("fd00::2")), enr.TCP6(30324), enr.QUIC6(30325),
+			},
+			expected: []string{"/ip4/1.2.3.4/udp/30305/quic-v1", "/ip4/1.2.3.4/tcp/30304"},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			node, id := createTestNodeWithEntries(t, tt.entries...)
+
+			multiAddrs, err := retrieveMultiAddrsFromNode(node)
+			require.NoError(t, err)
+
+			actual := make([]string, 0, len(multiAddrs))
+			for _, multiAddr := range multiAddrs {
+				actual = append(actual, multiAddr.String())
+			}
+
+			require.Equal(t, len(tt.expected), len(actual), "unexpected multiaddrs: %v", actual)
+			for i, multiAddr := range tt.expected {
+				assert.Equal(t, fmt.Sprintf("%s/p2p/%s", multiAddr, id), actual[i])
+			}
+		})
+	}
+}
+
+func TestConvertToUdpMultiAddr_DualStackPorts(t *testing.T) {
+	node, id := createTestNodeWithEntries(
+		t,
+		enr.IP(net.ParseIP("192.168.77.2")), enr.UDP(9000),
+		enr.IP(net.ParseIP("2001:db8::2")), enr.UDP6(9100),
+	)
+
+	multiAddrs, err := convertToUdpMultiAddr(node)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(multiAddrs))
+	assert.Equal(t, fmt.Sprintf("/ip4/192.168.77.2/udp/9000/p2p/%s", id), multiAddrs[0].String())
+	assert.Equal(t, fmt.Sprintf("/ip6/2001:db8::2/udp/9100/p2p/%s", id), multiAddrs[1].String())
 }

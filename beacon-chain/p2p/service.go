@@ -549,10 +549,11 @@ func (s *Service) connectToBootnodes() error {
 			return err
 		}
 		// do not dial bootnodes with their tcp ports not set
-		if err := bootNode.Record().Load(enr.WithEntry("tcp", new(enr.TCP))); err != nil {
-			if !enr.IsNotFound(err) {
-				log.WithError(err).Error("Could not retrieve tcp port")
-			}
+		_, ok, err := getPort(bootNode, tcp, bootNode.IP())
+		if err != nil {
+			log.WithError(err).Error("Could not retrieve tcp port")
+		}
+		if !ok {
 			continue
 		}
 		nodes = append(nodes, bootNode)
