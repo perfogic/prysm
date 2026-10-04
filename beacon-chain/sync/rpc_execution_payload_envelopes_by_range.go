@@ -62,6 +62,11 @@ func (s *Service) executionPayloadEnvelopesByRangeRPCHandler(ctx context.Context
 		tracing.AnnotateError(span, err)
 		return err
 	}
+	if rp.size == 0 {
+		recordResult(executionPayloadEnvelopeRPCResultServed)
+		closeStream(stream, log)
+		return nil
+	}
 	available := s.validateRangeAvailability(rp)
 	if !available {
 		recordResult(executionPayloadEnvelopeRPCResultResourceUnavailable)
@@ -213,22 +218,19 @@ func (s *Service) streamCanonicalEnvelopes(ctx context.Context, rp rangeParams, 
 }
 
 // validateEnvelopesByRange validates the ExecutionPayloadEnvelopesByRange request and returns
-// normalized rangeParams. Mirrors validateBlobsByRange in structure.
+// normalized rangeParams. Mirrors validateBlobsByRange in structure. A zero size means that
+// no envelope can exist in the requested range.
 func validateEnvelopesByRange(r *pb.ExecutionPayloadEnvelopesByRangeRequest, current primitives.Slot) (rangeParams, error) {
 	if r.Count == 0 {
 		return rangeParams{}, errors.Wrap(p2ptypes.ErrInvalidRequest, "invalid request Count parameter")
 	}
-	rp := rangeParams{
-		start: r.StartSlot,
-		size:  r.Count,
-	}
-	// Peers may overshoot the current slot when in initial sync — treat as noop rather than error.
-	if rp.start > current {
-		return rangeParams{start: current, end: current, size: 0}, nil
+	maxRequest := params.BeaconConfig().MaxRequestPayloads
+	if r.Count > maxRequest {
+		return rangeParams{}, errors.Wrapf(p2ptypes.ErrInvalidRequest, "count %d exceeds MAX_REQUEST_PAYLOADS %d", r.Count, maxRequest)
 	}
 
-	var err error
-	rp.end, err = rp.start.SafeAdd(rp.size - 1)
+	start := r.StartSlot
+	end, err := start.SafeAdd(r.Count - 1)
 	if err != nil {
 		return rangeParams{}, errors.Wrap(p2ptypes.ErrInvalidRequest, "overflow start + count - 1")
 	}
@@ -239,23 +241,16 @@ func validateEnvelopesByRange(r *pb.ExecutionPayloadEnvelopesByRangeRequest, cur
 		if err != nil {
 			return rangeParams{}, errors.Wrap(p2ptypes.ErrInvalidRequest, "could not compute Gloas fork start slot")
 		}
-		if rp.start < gloasStart {
-			rp.start = gloasStart
-		}
+		start = max(start, gloasStart)
 	}
+	end = min(end, current)
 
-	if rp.end > current {
-		rp.end = current
+	// Nothing to serve when the range lies entirely before the Gloas fork or after the current slot.
+	// Peers may overshoot the current slot when in initial sync — treat as noop rather than error.
+	if end < start {
+		return rangeParams{}, nil
 	}
-	if rp.end < rp.start {
-		rp.end = rp.start
-	}
-	maxRequest := params.BeaconConfig().MaxRequestPayloads
-	if rp.size > maxRequest {
-		rp.size = maxRequest
-	}
-
-	return rp, nil
+	return rangeParams{start: start, end: end, size: uint64(end-start) + 1}, nil
 }
 
 func (s *Service) canonicalSuccessorBlock(ctx context.Context, slot primitives.Slot) (interfaces.ReadOnlySignedBeaconBlock, [32]byte, error) {

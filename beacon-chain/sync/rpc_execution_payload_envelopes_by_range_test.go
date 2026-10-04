@@ -18,6 +18,7 @@ import (
 	mockExecution "github.com/OffchainLabs/prysm/v7/beacon-chain/execution/testing"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	p2ptest "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
+	p2ptypes "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
@@ -85,10 +86,22 @@ func TestValidateEnvelopesByRange(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:      "count above MaxRequestPayloads returns error",
+			req:       &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart, Count: 129},
+			current:   gloasStart + 2000,
+			expectErr: true,
+		},
+		{
 			name:       "start after current returns empty rangeParams",
 			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 500, Count: 10},
 			current:    400,
-			expectedRP: &rangeParams{start: 400, end: 400, size: 0},
+			expectedRP: &rangeParams{},
+		},
+		{
+			name:       "range entirely before Gloas returns empty rangeParams",
+			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart - 50, Count: 50},
+			current:    gloasStart + 200,
+			expectedRP: &rangeParams{},
 		},
 		{
 			name:       "normal range within limits",
@@ -102,19 +115,19 @@ func TestValidateEnvelopesByRange(t *testing.T) {
 			name:       "start partially before Gloas clamped to Gloas fork start",
 			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart - 10, Count: 50},
 			current:    gloasStart + 200,
-			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 39, size: 50},
+			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 39, size: 40},
 		},
 		{
 			name:       "end clamped to current slot",
-			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart, Count: 500},
+			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart, Count: 100},
 			current:    gloasStart + 10,
-			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 10, size: 128},
+			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 10, size: 11},
 		},
 		{
-			name:       "count capped at MaxRequestPayloads",
-			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart, Count: 1000},
+			name:       "count equal to MaxRequestPayloads is accepted",
+			req:        &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: gloasStart, Count: 128},
 			current:    gloasStart + 2000,
-			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 999, size: 128},
+			expectedRP: &rangeParams{start: gloasStart, end: gloasStart + 127, size: 128},
 		},
 	}
 
@@ -192,42 +205,50 @@ func TestExecutionPayloadEnvelopesByRangeRPCHandler(t *testing.T) {
 		require.ErrorContains(t, "message is not type", herr)
 	})
 
-	t.Run("invalid request count=0", func(t *testing.T) {
-		slot := primitives.Slot(100)
-		localP2P, remoteP2P := p2ptest.NewTestP2P(t), p2ptest.NewTestP2P(t)
-		protocolID := protocol.ID(topicFmt)
+	for _, tc := range []struct {
+		name  string
+		count uint64
+	}{
+		{name: "invalid request count=0", count: 0},
+		{name: "invalid request count above MaxRequestPayloads", count: params.BeaconConfig().MaxRequestPayloads + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			slot := primitives.Slot(100)
+			localP2P, remoteP2P := p2ptest.NewTestP2P(t), p2ptest.NewTestP2P(t)
+			protocolID := protocol.ID(topicFmt)
 
-		clock := startup.NewClock(time.Now(), params.BeaconConfig().GenesisValidatorsRoot, startup.WithSlotAsNow(slot))
-		svc := &Service{
-			cfg: &config{
-				p2p:   localP2P,
-				chain: &chainMock.ChainService{Slot: &slot},
-				clock: clock,
-			},
-			rateLimiter: newRateLimiter(localP2P),
-		}
+			clock := startup.NewClock(time.Now(), params.BeaconConfig().GenesisValidatorsRoot, startup.WithSlotAsNow(slot))
+			svc := &Service{
+				cfg: &config{
+					p2p:   localP2P,
+					chain: &chainMock.ChainService{Slot: &slot},
+					clock: clock,
+				},
+				rateLimiter: newRateLimiter(localP2P),
+			}
 
-		var wg sync.WaitGroup
-		wg.Add(1)
-		remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
-			defer wg.Done()
-			code, _, readErr := readStatusCodeNoDeadline(stream, localP2P.Encoding())
-			assert.NoError(t, readErr)
-			assert.Equal(t, responseCodeInvalidRequest, code)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
+				defer wg.Done()
+				code, _, readErr := readStatusCodeNoDeadline(stream, localP2P.Encoding())
+				assert.NoError(t, readErr)
+				assert.Equal(t, responseCodeInvalidRequest, code)
+			})
+
+			localP2P.Connect(remoteP2P)
+			stream, streamErr := localP2P.BHost.NewStream(ctx, remoteP2P.BHost.ID(), protocolID)
+			require.NoError(t, streamErr)
+
+			msg := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 10, Count: tc.count}
+			handlerErr := svc.executionPayloadEnvelopesByRangeRPCHandler(ctx, msg, stream)
+			require.ErrorIs(t, handlerErr, p2ptypes.ErrInvalidRequest)
+
+			if util.WaitTimeout(&wg, 2*time.Second) {
+				t.Fatal("timed out waiting for remote stream handler")
+			}
 		})
-
-		localP2P.Connect(remoteP2P)
-		stream, streamErr := localP2P.BHost.NewStream(ctx, remoteP2P.BHost.ID(), protocolID)
-		require.NoError(t, streamErr)
-
-		msg := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 10, Count: 0}
-		handlerErr := svc.executionPayloadEnvelopesByRangeRPCHandler(ctx, msg, stream)
-		require.NotNil(t, handlerErr)
-
-		if util.WaitTimeout(&wg, 2*time.Second) {
-			t.Fatal("timed out waiting for remote stream handler")
-		}
-	})
+	}
 
 	t.Run("nominal sends chunks for saved envelopes", func(t *testing.T) {
 		beaconDB := testDB.SetupDB(t)
@@ -436,135 +457,154 @@ func TestExecutionPayloadEnvelopesByRangeRPCHandler(t *testing.T) {
 		assert.Equal(t, primitives.Slot(30), receivedSlots[1])
 	})
 
-	// The next two subtests exercise the head-root fallback: nothing is indexed above the
+	// The next subtests exercise the head-root fallback: nothing is indexed above the
 	// requested range, so the successor lookup returns the chain tip itself. The tip's own
 	// envelope is served only when fork choice selects the tip's full payload variant.
-	runChainTipCase := func(t *testing.T, tipIsFull bool, wantSlots []primitives.Slot) {
-		beaconDB := testDB.SetupDB(t)
-		localP2P, remoteP2P := p2ptest.NewTestP2P(t), p2ptest.NewTestP2P(t)
-		protocolID := protocol.ID(topicFmt)
-
-		currentSlot := primitives.Slot(50)
-		clock := startup.NewClock(time.Now(), params.BeaconConfig().GenesisValidatorsRoot, startup.WithSlotAsNow(currentSlot))
-
-		// Payload hashes are distinct from block roots so the tip's own payload is only
-		// reachable through its bid's BlockHash, never through a descendant's ParentBlockHash.
-		payloadHash := func(sl primitives.Slot) [32]byte {
-			var h [32]byte
-			h[0] = 0xaa
-			h[1] = byte(sl)
-			return h
-		}
-
-		// Build blocks at slots 10, 20, 30 with nothing indexed above; slot 30 is the chain tip.
-		blockSlots := []primitives.Slot{10, 20, 30}
-		roots := make([][32]byte, len(blockSlots))
-		var prevRoot, prevHash [32]byte
-
-		for i, sl := range blockSlots {
-			h := payloadHash(sl)
-			blk := util.NewBeaconBlockGloas()
-			blk.Block.Slot = sl
-			copy(blk.Block.ParentRoot, prevRoot[:])
-			copy(blk.Block.Body.SignedExecutionPayloadBid.Message.ParentBlockHash, prevHash[:])
-			copy(blk.Block.Body.SignedExecutionPayloadBid.Message.BlockHash, h[:])
-			wsb := util.SaveBlock(t, ctx, beaconDB, blk)
-			htr, hErr := wsb.Block().HashTreeRoot()
-			require.NoError(t, hErr)
-			roots[i] = htr
-
-			env := testSignedEnvelope(sl, htr[:])
-			// Replace (not copy over) the payload block hash: the helper aliases it to BeaconBlockRoot.
-			env.Message.Payload.BlockHash = h[:]
-			copy(env.Message.Payload.ParentHash, prevHash[:])
-			require.NoError(t, beaconDB.SaveExecutionPayloadEnvelope(ctx, env))
-
-			prevRoot, prevHash = htr, h
-		}
-
-		headRoot := roots[len(roots)-1]
-		require.NoError(t, beaconDB.SaveStateSummary(ctx, &pb.StateSummary{Slot: blockSlots[len(blockSlots)-1], Root: headRoot[:]}))
-		require.NoError(t, beaconDB.SaveHeadBlockRoot(ctx, headRoot))
-
-		mockEngine := &mockExecution.EngineClient{
-			ExecutionPayloadByBlockHash: make(map[[32]byte]*engpb.ExecutionPayload, len(blockSlots)),
-			SlotByBlockHash:             make(map[[32]byte]primitives.Slot, len(blockSlots)),
-		}
-		for _, sl := range blockSlots {
-			h := payloadHash(sl)
-			mockEngine.ExecutionPayloadByBlockHash[h] = &engpb.ExecutionPayload{
-				ParentHash:    make([]byte, 32),
-				FeeRecipient:  make([]byte, 20),
-				StateRoot:     make([]byte, 32),
-				ReceiptsRoot:  make([]byte, 32),
-				LogsBloom:     make([]byte, 256),
-				PrevRandao:    make([]byte, 32),
-				BaseFeePerGas: make([]byte, 32),
-				BlockHash:     h[:],
-			}
-			mockEngine.SlotByBlockHash[h] = sl
-		}
-
-		chain := &chainMock.ChainService{}
-		if tipIsFull {
-			chain.ForkchoiceRoots = map[[32]byte]bool{headRoot: true}
-		}
-
-		svc := &Service{
-			cfg: &config{
-				p2p:                    localP2P,
-				beaconDB:               beaconDB,
-				chain:                  chain,
-				clock:                  clock,
-				executionReconstructor: mockEngine,
-			},
-			availableBlocker: mockBlocker{avail: true},
-			rateLimiter:      newRateLimiter(localP2P),
-		}
-
-		receivedSlots := make([]primitives.Slot, 0)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
-			defer wg.Done()
-			for {
-				env, readErr := readChunkedExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
-				if errors.Is(readErr, io.EOF) {
-					break
-				}
-				assert.NoError(t, readErr)
-				if env != nil {
-					receivedSlots = append(receivedSlots, primitives.Slot(env.Message.Payload.SlotNumber))
-				}
-			}
-		})
-
-		localP2P.Connect(remoteP2P)
-		stream, streamErr := localP2P.BHost.NewStream(ctx, remoteP2P.BHost.ID(), protocolID)
-		require.NoError(t, streamErr)
-
-		// Request slots 5-35; nothing is indexed above 35, so the successor lookup falls back to the tip at 30.
-		msg := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: 31}
-		handlerErr := svc.executionPayloadEnvelopesByRangeRPCHandler(ctx, msg, stream)
-		require.NoError(t, handlerErr)
-
-		if util.WaitTimeout(&wg, 2*time.Second) {
-			t.Fatal("timed out waiting for remote stream handler")
-		}
-
-		require.Equal(t, len(wantSlots), len(receivedSlots))
-		for i, sl := range wantSlots {
-			assert.Equal(t, sl, receivedSlots[i])
-		}
-	}
-
+	// Request slots 5-35; nothing is indexed above 35, so the successor lookup falls back to the tip at 30.
 	t.Run("serves the tip envelope when fork choice holds the tip full", func(t *testing.T) {
-		runChainTipCase(t, true, []primitives.Slot{10, 20, 30})
+		got := serveEnvelopesByRangeFromChain(t, []primitives.Slot{10, 20, 30}, 50, true, &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: 31})
+		require.DeepEqual(t, []primitives.Slot{10, 20, 30}, got)
 	})
 
 	t.Run("excludes the tip envelope when fork choice holds the tip empty", func(t *testing.T) {
-		runChainTipCase(t, false, []primitives.Slot{10, 20})
+		got := serveEnvelopesByRangeFromChain(t, []primitives.Slot{10, 20, 30}, 50, false, &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: 31})
+		require.DeepEqual(t, []primitives.Slot{10, 20}, got)
 	})
+
+	// A full tip at the current slot lies below a start slot past the current slot and must not be served.
+	t.Run("start after current slot serves nothing", func(t *testing.T) {
+		got := serveEnvelopesByRangeFromChain(t, []primitives.Slot{10, 20, 30}, 30, true, &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 31, Count: 1})
+		require.Equal(t, 0, len(got))
+	})
+}
+
+// The first Gloas envelope lies after a range that ends before the Gloas fork and must not be served.
+func TestExecutionPayloadEnvelopesByRangeRPCHandlerPreGloasRange(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.BeaconConfig().Copy()
+	cfg.GloasForkEpoch = 1
+	cfg.MaxRequestPayloads = 128
+	params.OverrideBeaconConfig(cfg)
+	params.BeaconConfig().InitializeForkSchedule()
+
+	gloasStart := util.SlotAtEpoch(t, params.BeaconConfig().GloasForkEpoch)
+	blockSlots := []primitives.Slot{gloasStart, gloasStart + 1, gloasStart + 2}
+	got := serveEnvelopesByRangeFromChain(t, blockSlots, gloasStart+10, true, &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 0, Count: 10})
+	require.Equal(t, 0, len(got))
+}
+
+// serveEnvelopesByRangeFromChain saves a chain with a full payload at every slot in blockSlots and
+// nothing indexed above the last one, the chain tip. It serves req at currentSlot and returns the
+// slots of the envelopes written to the stream.
+func serveEnvelopesByRangeFromChain(
+	t *testing.T,
+	blockSlots []primitives.Slot,
+	currentSlot primitives.Slot,
+	tipIsFull bool,
+	req *pb.ExecutionPayloadEnvelopesByRangeRequest,
+) []primitives.Slot {
+	ctx := t.Context()
+	protocolID := protocol.ID(fmt.Sprintf("%s/ssz_snappy", p2p.RPCExecutionPayloadEnvelopesByRangeTopicV1))
+	ctxMap, err := ContextByteVersionsForValRoot(params.BeaconConfig().GenesisValidatorsRoot)
+	require.NoError(t, err)
+
+	beaconDB := testDB.SetupDB(t)
+	localP2P, remoteP2P := p2ptest.NewTestP2P(t), p2ptest.NewTestP2P(t)
+	clock := startup.NewClock(time.Now(), params.BeaconConfig().GenesisValidatorsRoot, startup.WithSlotAsNow(currentSlot))
+
+	// Payload hashes are distinct from block roots so the tip's own payload is only
+	// reachable through its bid's BlockHash, never through a descendant's ParentBlockHash.
+	payloadHash := func(sl primitives.Slot) [32]byte {
+		var h [32]byte
+		h[0] = 0xaa
+		h[1] = byte(sl)
+		return h
+	}
+
+	mockEngine := &mockExecution.EngineClient{
+		ExecutionPayloadByBlockHash: make(map[[32]byte]*engpb.ExecutionPayload, len(blockSlots)),
+		SlotByBlockHash:             make(map[[32]byte]primitives.Slot, len(blockSlots)),
+	}
+	var prevRoot, prevHash [32]byte
+	for _, sl := range blockSlots {
+		h := payloadHash(sl)
+		blk := util.NewBeaconBlockGloas()
+		blk.Block.Slot = sl
+		copy(blk.Block.ParentRoot, prevRoot[:])
+		copy(blk.Block.Body.SignedExecutionPayloadBid.Message.ParentBlockHash, prevHash[:])
+		copy(blk.Block.Body.SignedExecutionPayloadBid.Message.BlockHash, h[:])
+		wsb := util.SaveBlock(t, ctx, beaconDB, blk)
+		htr, err := wsb.Block().HashTreeRoot()
+		require.NoError(t, err)
+
+		env := testSignedEnvelope(sl, htr[:])
+		// Replace (not copy over) the payload block hash: the helper aliases it to BeaconBlockRoot.
+		env.Message.Payload.BlockHash = h[:]
+		copy(env.Message.Payload.ParentHash, prevHash[:])
+		require.NoError(t, beaconDB.SaveExecutionPayloadEnvelope(ctx, env))
+
+		mockEngine.ExecutionPayloadByBlockHash[h] = &engpb.ExecutionPayload{
+			ParentHash:    make([]byte, 32),
+			FeeRecipient:  make([]byte, 20),
+			StateRoot:     make([]byte, 32),
+			ReceiptsRoot:  make([]byte, 32),
+			LogsBloom:     make([]byte, 256),
+			PrevRandao:    make([]byte, 32),
+			BaseFeePerGas: make([]byte, 32),
+			BlockHash:     h[:],
+		}
+		mockEngine.SlotByBlockHash[h] = sl
+		prevRoot, prevHash = htr, h
+	}
+
+	headRoot := prevRoot
+	require.NoError(t, beaconDB.SaveStateSummary(ctx, &pb.StateSummary{Slot: blockSlots[len(blockSlots)-1], Root: headRoot[:]}))
+	require.NoError(t, beaconDB.SaveHeadBlockRoot(ctx, headRoot))
+
+	chain := &chainMock.ChainService{}
+	if tipIsFull {
+		chain.ForkchoiceRoots = map[[32]byte]bool{headRoot: true}
+	}
+
+	svc := &Service{
+		cfg: &config{
+			p2p:                    localP2P,
+			beaconDB:               beaconDB,
+			chain:                  chain,
+			clock:                  clock,
+			executionReconstructor: mockEngine,
+		},
+		availableBlocker: mockBlocker{avail: true},
+		rateLimiter:      newRateLimiter(localP2P),
+	}
+
+	receivedSlots := make([]primitives.Slot, 0)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
+		defer wg.Done()
+		for {
+			env, readErr := readChunkedExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			if readErr != nil {
+				t.Error(readErr)
+				break
+			}
+			receivedSlots = append(receivedSlots, primitives.Slot(env.Message.Payload.SlotNumber))
+		}
+	})
+
+	localP2P.Connect(remoteP2P)
+	stream, err := localP2P.BHost.NewStream(ctx, remoteP2P.BHost.ID(), protocolID)
+	require.NoError(t, err)
+	require.NoError(t, svc.executionPayloadEnvelopesByRangeRPCHandler(ctx, req, stream))
+
+	if util.WaitTimeout(&wg, 2*time.Second) {
+		t.Fatal("timed out waiting for remote stream handler")
+	}
+	return receivedSlots
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +730,23 @@ func TestSendExecutionPayloadEnvelopesByRangeRequest(t *testing.T) {
 		_, recvErr := SendExecutionPayloadEnvelopesByRangeRequest(ctx, clock, p1, p2.PeerID(), ctxMap, req)
 		require.NotNil(t, recvErr)
 		assert.ErrorContains(t, "not greater than previous slot", recvErr)
+	})
+
+	t.Run("count above MaxRequestPayloads is not sent", func(t *testing.T) {
+		p1 := p2ptest.NewTestP2P(t)
+		p2 := p2ptest.NewTestP2P(t)
+		p1.Connect(p2)
+
+		requested := false
+		p2.SetStreamHandler(topic, func(stream network.Stream) {
+			requested = true
+			assert.NoError(t, stream.Close())
+		})
+
+		req := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: params.BeaconConfig().MaxRequestPayloads + 1}
+		_, recvErr := SendExecutionPayloadEnvelopesByRangeRequest(ctx, clock, p1, p2.PeerID(), ctxMap, req)
+		require.ErrorIs(t, recvErr, p2ptypes.ErrMaxPayloadEnvelopeReqExceeded)
+		assert.Equal(t, false, requested)
 	})
 
 	t.Run("peer exceeds requested count returns error", func(t *testing.T) {

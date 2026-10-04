@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	prysmsync "github.com/OffchainLabs/prysm/v7/beacon-chain/sync"
+	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
@@ -221,4 +222,76 @@ func TestValidatePayloadBlockConsistency(t *testing.T) {
 		require.Equal(t, false, errors.Is(r.err, prysmsync.ErrInvalidFetchedData))
 	})
 
+}
+
+func TestPayloadEnvelopesRange(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.BeaconConfig().Copy()
+	cfg.GloasForkEpoch = 0
+	cfg.MaxRequestPayloads = 128
+	params.OverrideBeaconConfig(cfg)
+
+	blocksAt := func(first, last primitives.Slot) []blocks.BlockWithROSidecars {
+		bwb := make([]blocks.BlockWithROSidecars, 0, last-first+1)
+		var parentRoot [32]byte
+		for slot := first; slot <= last; slot++ {
+			b := makeGloasBlock(t, slot, parentRoot, [32]byte{})
+			parentRoot = b.Root()
+			bwb = append(bwb, blocks.BlockWithROSidecars{Block: b})
+		}
+		return bwb
+	}
+
+	tests := []struct {
+		name           string
+		start          primitives.Slot
+		count          uint64
+		bwb            []blocks.BlockWithROSidecars
+		wantStart      primitives.Slot
+		wantCount      uint64
+		wantFirstBlock primitives.Slot
+		wantLastBlock  primitives.Slot
+	}{
+		{
+			name:           "batch within MaxRequestPayloads starts one slot early",
+			start:          100,
+			count:          64,
+			bwb:            blocksAt(100, 163),
+			wantStart:      99,
+			wantCount:      64,
+			wantFirstBlock: 100,
+			wantLastBlock:  163,
+		},
+		{
+			name:           "batch above MaxRequestPayloads is cut to the range",
+			start:          100,
+			count:          256,
+			bwb:            blocksAt(100, 355),
+			wantStart:      99,
+			wantCount:      128,
+			wantFirstBlock: 100,
+			wantLastBlock:  227,
+		},
+		{
+			name:           "range moves to the first block when it starts beyond MaxRequestPayloads",
+			start:          100,
+			count:          300,
+			bwb:            blocksAt(300, 399),
+			wantStart:      300,
+			wantCount:      128,
+			wantFirstBlock: 300,
+			wantLastBlock:  399,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &fetchRequestResponse{start: tt.start, count: tt.count, bwb: tt.bwb}
+			start, count := payloadEnvelopesRange(r)
+			require.Equal(t, tt.wantStart, start)
+			require.Equal(t, tt.wantCount, count)
+			require.Equal(t, true, count <= params.BeaconConfig().MaxRequestPayloads)
+			require.Equal(t, tt.wantFirstBlock, r.bwb[0].Block.Block().Slot())
+			require.Equal(t, tt.wantLastBlock, r.bwb[len(r.bwb)-1].Block.Block().Slot())
+		})
+	}
 }

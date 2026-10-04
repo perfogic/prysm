@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 
 	prysmsync "github.com/OffchainLabs/prysm/v7/beacon-chain/sync"
 	"github.com/OffchainLabs/prysm/v7/config/params"
@@ -153,12 +154,8 @@ func (f *blocksFetcher) fetchPayloads(ctx context.Context, r *fetchRequestRespon
 	}
 
 	// The whole block batch is gloas
-	start := r.start
-	gloasStart, err := slots.EpochStart(params.BeaconConfig().GloasForkEpoch)
-	if err == nil && start > gloasStart {
-		start--
-	}
-	envelopes, pid, err := f.fetchPayloadEnvelopesFromPeer(ctx, start, r.count, r.blocksFrom, peers)
+	start, count := payloadEnvelopesRange(r)
+	envelopes, pid, err := f.fetchPayloadEnvelopesFromPeer(ctx, start, count, r.blocksFrom, peers)
 	if err != nil {
 		r.err = errors.Wrap(err, "fetch payload envelopes from peer")
 		r.payloadsFrom = ""
@@ -167,6 +164,36 @@ func (f *blocksFetcher) fetchPayloads(ctx context.Context, r *fetchRequestRespon
 	r.envelopes = envelopes
 	r.payloadsFrom = pid
 	f.validatePayloadBlockConsistency(r)
+}
+
+// payloadEnvelopesRange returns the slot range of the execution payload envelopes to request for the
+// Gloas blocks in `r.bwb`. The range starts one slot early to also fetch the envelope of the previous
+// batch's last block. A range request may not exceed MAX_REQUEST_PAYLOADS, while fork recovery or a
+// block batch limit above it can produce wider block sets. In that case the range is shortened and
+// `r.bwb` is cut to the blocks the shortened range still serves.
+func payloadEnvelopesRange(r *fetchRequestResponse) (primitives.Slot, uint64) {
+	start := r.start
+	gloasStart, err := slots.EpochStart(params.BeaconConfig().GloasForkEpoch)
+	if err == nil && start > gloasStart {
+		start--
+	}
+	limit := params.BeaconConfig().MaxRequestPayloads
+	if r.count <= limit {
+		return start, r.count
+	}
+
+	// The range must reach the first block, otherwise no block of the batch could be kept.
+	if first := r.bwb[0].Block.Block().Slot(); first >= start.Add(limit) {
+		start = first
+	}
+	// Like the last block of an unbounded batch, the block right after the range is kept:
+	// its own envelope is only needed by its child, which the next batch fetches.
+	last := start.Add(limit)
+	cut := sort.Search(len(r.bwb), func(i int) bool {
+		return r.bwb[i].Block.Block().Slot() > last
+	})
+	r.bwb = r.bwb[:cut]
+	return start, limit
 }
 
 // fetchPayloadEnvelopesFromPeer fetches execution payload envelopes by range,

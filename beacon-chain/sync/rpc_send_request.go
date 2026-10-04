@@ -964,6 +964,10 @@ func SendExecutionPayloadEnvelopesByRangeRequest(
 	ctxMap ContextByteVersions,
 	req *ethpb.ExecutionPayloadEnvelopesByRangeRequest,
 ) ([]*ethpb.SignedExecutionPayloadEnvelope, error) {
+	if req.Count > params.BeaconConfig().MaxRequestPayloads {
+		return nil, errors.Wrapf(p2ptypes.ErrMaxPayloadEnvelopeReqExceeded, "count=%d", req.Count)
+	}
+
 	topic, err := p2p.TopicFromMessage(p2p.ExecutionPayloadEnvelopesByRangeName, slots.ToEpoch(tor.CurrentSlot()))
 	if err != nil {
 		return nil, err
@@ -979,7 +983,7 @@ func SendExecutionPayloadEnvelopesByRangeRequest(
 	}
 	defer closeStream(stream, log)
 
-	max := min(req.Count, params.BeaconConfig().MaxRequestPayloads)
+	max := req.Count
 
 	envelopes := make([]*ethpb.SignedExecutionPayloadEnvelope, 0, max)
 	var prevSlot primitives.Slot
